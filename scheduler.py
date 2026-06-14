@@ -56,12 +56,24 @@ class Scheduler:
 
     def _admit_waiting_requests(self) -> None:
         """Move waiting requests to active batch with fair round-robin scheduling."""
-        while len(self.active) < self.max_batch_size and self.user_order:
+        users_checked = 0
+        max_users_to_check = len(self.user_order)
+
+        while self.user_order and users_checked < max_users_to_check:
+            # Calculate current KV cache usage
+            current_kv_usage = sum(kv_blocks_for(req) for req in self.active)
+
             user_id = self.user_order.popleft()
+            users_checked += 1
 
             if user_id in self.waiting_by_user and self.waiting_by_user[user_id]:
-                request = self.waiting_by_user[user_id].popleft()
-                self.active.append(request)
+                next_request = self.waiting_by_user[user_id][0]  # Peek at next request
+                next_kv_needed = kv_blocks_for(next_request)
+
+                # Check if we have space for this request
+                if current_kv_usage + next_kv_needed <= MAX_KV_BLOCKS:
+                    request = self.waiting_by_user[user_id].popleft()
+                    self.active.append(request)
 
                 # If this user still has waiting requests, put them back in queue
                 if self.waiting_by_user[user_id]:
@@ -84,10 +96,12 @@ class Scheduler:
             remaining_prefill = self._prefill_remaining.get(request.request_id, 0)
 
             if remaining_prefill > 0:
+                # Still prefilling, just decrement counter - don't process
                 self._prefill_remaining[request.request_id] = remaining_prefill - 1
-                decode_batch.append(request)
             else:
-                request.started_at = time.time()
+                # Prefill done, ready for generation
+                if request.started_at is None:
+                    request.started_at = time.time()
                 decode_batch.append(request)
 
         if not decode_batch:
@@ -97,8 +111,6 @@ class Scheduler:
         if decode_batch:
             tokens = forward(decode_batch)
             for request, token in zip(decode_batch, tokens):
-                if request.started_at is None:
-                    request.started_at = time.time()
                 request.generated.append(token)
                 self._generated_tokens += 1
 
@@ -127,9 +139,16 @@ class Scheduler:
 
     def has_active(self) -> bool:
         """True if any request is in-flight or waiting."""
-        if not self.active:
-            return False
-        return True
+        # Check active requests
+        if self.active:
+            return True
+
+        # Check waiting requests
+        for user_queue in self.waiting_by_user.values():
+            if user_queue:
+                return True
+
+        return False
 
     def metrics(self) -> dict:
         """{ throughput_tokens_per_sec, avg_latency_s, p99_latency_s, gpu_utilization }"""
