@@ -7,11 +7,27 @@ thresholds.
 """
 
 from inference_stub import Request, forward, MAX_KV_BLOCKS, EOS_TOKEN, kv_blocks_for
+import time
+from collections import defaultdict, deque
 
 
 class Scheduler:
     def __init__(self) -> None:
-        raise NotImplementedError
+        # Use available KV blocks as the practical batch size limit
+        self.max_batch_size = MAX_KV_BLOCKS
+        # Waiting requests are grouped by user to ensure fairness.
+        self.waiting_by_user: dict[str, deque[Request]] = defaultdict(deque)
+        self.user_order: deque[str] = deque()
+
+        # Requests currently occupying GPU batch slots.
+        self.active: list[Request] = []
+
+        # Metrics
+        self._tick = 0
+        self._non_empty_ticks = 0
+        self._generated_tokens = 0
+        self._latencies: list[float] = []
+        self._start_time = time.time()
 
     def submit(self, request: Request) -> None:
         """Accept a new request. Returns immediately."""
